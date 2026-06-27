@@ -3,17 +3,11 @@ print("HAL Harmonic initializing", flush=True)
 import sys, os, time, math
 import rclpy
 import numpy as np
+from sensor_msgs.msg import JointState
 
 from rclpy.node import Node
 from ros2srrc_data.msg import Robpose
-from linkattacher_msgs.srv import AttachLink, DetachLink
 from ament_index_python.packages import get_package_share_directory
-
-# Gripper (NO modificar según tu requisito)
-from rclpy.action import ActionClient
-from control_msgs.action import FollowJointTrajectory
-from trajectory_msgs.msg import JointTrajectoryPoint
-from builtin_interfaces.msg import Duration
 
 from std_msgs.msg import Bool, String
 
@@ -45,21 +39,13 @@ HAL.graspable_pub = HAL.create_publisher(
     10,
 )
 
-HAL.gripper_client = ActionClient(
-    HAL, FollowJointTrajectory, "/gripper_controller/follow_joint_trajectory"
-)
-
-print("[HAL] Waiting for gripper controller...")
-while not HAL.gripper_client.wait_for_server(timeout_sec=1.0):
-    print("[HAL] Waiting for gripper controller...")
-print("[HAL] Gripper ready")
-
-print("[HAL] LinkAttacher ready")
+# Objects the suction gripper is allowed to pick. The gz_link_attacher matches
+# these as substrings of the colliding model name, so "box" covers every box
+# the feeder spawns (box_<run_id>_<counter>).
+GRASPABLE_OBJECTS = "box"
 
 graspable_msg = String()
-
-graspable_msg.data = "blue_ball,green_cylinder,yellow_box,red_box"
-
+graspable_msg.data = GRASPABLE_OBJECTS
 HAL.graspable_pub.publish(graspable_msg)
 
 print("[HAL] Published graspable objects")
@@ -68,12 +54,11 @@ print("[HAL] Published graspable objects")
 def publish_graspable_objects():
 
     graspable_msg = String()
-
-    graspable_msg.data = "blue_ball," "green_cylinder," "yellow_box"
-
+    graspable_msg.data = GRASPABLE_OBJECTS
     HAL.graspable_pub.publish(graspable_msg)
 
 
+# Periodic republish so late-joining subscribers receive the list
 HAL.create_timer(1.0, publish_graspable_objects)
 
 # ==============================================================
@@ -215,6 +200,33 @@ def MoveJoint(abs_xyz, abs_ypr, speed, wait_time):
 # ==============================================================
 
 
+def _wait_motion_complete(timeout=15.0, vel_threshold=0.01, stable_count=8):
+    """Block until all joint velocities stay below threshold for stable_count cycles."""
+    latest = [None]
+
+    sub = HAL.create_subscription(
+        JointState, '/joint_states',
+        lambda msg: latest.__setitem__(0, msg),
+        10
+    )
+    stable = 0
+    deadline = time.time() + timeout
+    try:
+        while time.time() < deadline:
+            rclpy.spin_once(HAL, timeout_sec=0.05)
+            msg = latest[0]
+            if msg is not None and len(msg.velocity) > 0:
+                if all(abs(v) < vel_threshold for v in msg.velocity):
+                    stable += 1
+                    if stable >= stable_count:
+                        return True
+                else:
+                    stable = 0
+    finally:
+        HAL.destroy_subscription(sub)
+    return False
+
+
 def MoveRelLinear(relative_xyz, speed, wait_time):
 
     ACTION = Action()
@@ -234,6 +246,7 @@ def MoveRelLinear(relative_xyz, speed, wait_time):
         print(
             f"Movement Execution Time: {EXECUTION['ExecTime']} s at Robot Speed: {speed*100} %"
         )
+        _wait_motion_complete()   # block until joint velocities settle
     else:
         print("Robot movement FAILED, check REASON in MoveIt output")
 
@@ -303,86 +316,30 @@ def MoveSingleJ(joint_number, relative_angle, speed, wait_time):
 
 
 # ==============================================================
-# GRIPPER CONTROL
+# SUCTION GRIPPER CONTROL
 # ==============================================================
 
 
-def GripperSet(relative_closure, wait_time):
+def SuctionSet(on, wait_time):
     """
-    0%   = open
-    100% = closed
+    Turn the suction (vacuum) gripper on or off.
+
+    on = True   -> grip: any graspable object touching the cup is attached
+    on = False  -> release: the held object is detached
+
+    The suction cup has no actuated joint and no controller. Gripping is handled
+    by the gz_link_attacher plugin, which rigidly attaches an object to the cup
+    link on contact while auto-attach is enabled and releases it when disabled.
     """
 
     print("\n==================================================")
-    print("[HAL] GripperSet() called")
-    print(f"[HAL] Requested closure: {relative_closure} %")
-    print(f"[HAL] Wait time: {wait_time} s")
-
-    # ==========================================================
-    # ENABLE/DISABLE AUTO ATTACH
-    # ==========================================================
+    print(f"[HAL] SuctionSet({on}) called")
 
     auto_msg = Bool()
-
-    # If closing -> enable contact detection
-    if relative_closure > 5:
-
-        auto_msg.data = True
-
-        print("[HAL] AutoAttach ENABLED")
-
-    else:
-
-        auto_msg.data = False
-
-        print("[HAL] AutoAttach DISABLED")
-
+    auto_msg.data = bool(on)
     HAL.auto_attach_pub.publish(auto_msg)
 
-    print("[HAL] AutoAttach message published")
-
-    # ==========================================================
-    # GRIPPER MOTION
-    # ==========================================================
-
-    max_open = 1.0
-    min_close = 0.0
-
-    position = min_close + ((max_open - min_close) * (relative_closure / 100.0))
-
-    print(f"[HAL] Target gripper joint position: {position}")
-
-    goal_msg = FollowJointTrajectory.Goal()
-
-    goal_msg.trajectory.joint_names = ["robotiq_85_left_knuckle_joint"]
-
-    point = JointTrajectoryPoint()
-
-    point.positions = [position]
-    point.time_from_start = Duration(sec=1)
-
-    goal_msg.trajectory.points.append(point)
-
-    print("[HAL] Sending gripper trajectory...")
-
-    future = HAL.gripper_client.send_goal_async(goal_msg)
-
-    rclpy.spin_until_future_complete(HAL, future)
-
-    goal_handle = future.result()
-
-    if not goal_handle.accepted:
-
-        print("[HAL] ERROR: Gripper trajectory rejected")
-        return
-
-    print("[HAL] Gripper trajectory accepted")
-
-    result_future = goal_handle.get_result_async()
-
-    rclpy.spin_until_future_complete(HAL, result_future)
-
-    print("[HAL] Gripper motion completed")
+    print(f"[HAL] Suction {'ENABLED' if on else 'DISABLED'}")
 
     time.sleep(wait_time)
 

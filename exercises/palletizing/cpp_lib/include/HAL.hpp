@@ -33,8 +33,9 @@ public:
     // Relative TCP reorientation. ypr in degrees.
     static void MoveRelReor(const std::array<double, 3>& ypr, double speed, double wait_time);
 
-    // Gripper control. relative_closure in [0,100] (0 = fully open, 100 = fully closed).
-    static void GripperSet(double relative_closure, double wait_time);
+    // Suction gripper control. on = true grips a graspable object in contact
+    // with the cup, on = false releases the held object. wait_time in seconds.
+    static void SuctionSet(bool on, double wait_time);
 
 private:
     static void init();
