@@ -62,6 +62,54 @@ def publish_graspable_objects():
 HAL.create_timer(1.0, publish_graspable_objects)
 
 # ==============================================================
+# CONVEYOR HANDSHAKE (feeder coordination)
+# ==============================================================
+# The conveyor feeder (box_spawner) and the robot coordinate with a two-message
+# handshake so boxes are picked one at a time and never pile up:
+#   - the feeder publishes a box name on /box_ready when a box is stopped at the
+#     pickup point, then waits;
+#   - the robot calls BoxDone(name) once the box is palletized, which publishes
+#     on /box_done and releases the next box.
+# Keeping this on the HAL node means the student's solution only ever calls
+# WaitForBox()/BoxDone() and never touches ROS topics directly.
+
+HAL._ready_box = None
+HAL._processed_boxes = set()
+
+
+def _on_box_ready(msg):
+    # Ignore re-announcements of a box we've already handed to the solution.
+    if msg.data not in HAL._processed_boxes:
+        HAL._ready_box = msg.data
+
+
+HAL.create_subscription(String, "/box_ready", _on_box_ready, 10)
+HAL.box_done_pub = HAL.create_publisher(String, "/box_done", 10)
+
+
+def WaitForBox():
+    """Block until the feeder announces a box at the pickup point.
+
+    Returns the box name (str). Use it as the handle to pass to BoxDone() once
+    the box has been stacked on the pallet.
+    """
+    HAL._ready_box = None
+    while rclpy.ok() and HAL._ready_box is None:
+        rclpy.spin_once(HAL, timeout_sec=0.1)
+    HAL._processed_boxes.add(HAL._ready_box)
+    return HAL._ready_box
+
+
+def BoxDone(name):
+    """Tell the feeder the box has been palletized; releases the next box.
+
+    Pass the name returned by WaitForBox().
+    """
+    HAL.box_done_pub.publish(String(data=name))
+    print(f"[HAL] BoxDone({name}) -> released next box")
+
+
+# ==============================================================
 # MoveAbsJ (IDÉNTICO a classic)
 # ==============================================================
 

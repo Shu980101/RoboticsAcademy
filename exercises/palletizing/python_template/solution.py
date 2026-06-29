@@ -4,11 +4,11 @@ This is the code a student writes in the web editor. It drives the UR10 + suctio
 gripper through the palletizing task: a conveyor feeds boxes one at a time to a
 fixed pickup point, and the robot stacks them into an ordered grid on the pallet.
 
-Coordination with the feeder (box_spawner.py) is a two-message handshake:
-  - the feeder publishes the box name on /box_ready when a box is stopped at the
-    pickup point, and then waits;
-  - this code picks and stacks the box, then publishes the name on /box_done,
-    which releases the next box.
+Coordination with the feeder (box_spawner.py) is a two-call handshake, fully
+wrapped by the HAL so this code never touches ROS directly:
+  - HAL.WaitForBox() blocks until a box is stopped at the pickup point and
+    returns its name;
+  - HAL.BoxDone(name) reports the box is stacked, which releases the next box.
 
 IMPORTANT — coordinate frames and tuning
 ========================================
@@ -23,10 +23,6 @@ heights are expressed as tunable constants below and need ONE calibration pass i
 sim: jog the TCP to the box top, read off the pose, and adjust CUP_REACH so the
 cup just touches the box. Everything marked `# TUNE` is a candidate to adjust.
 """
-
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import String
 
 import HAL_Harmonic as HAL
 
@@ -101,34 +97,7 @@ def grid_cell(index):
     return x, y, z, layer, row, col
 
 
-class FeederLink(Node):
-    """Handshake node: receive /box_ready, acknowledge with /box_done."""
-
-    def __init__(self):
-        super().__init__("palletizing_solution")
-        self._ready_box = None
-        self._processed_boxes = set()
-        self.create_subscription(String, "/box_ready", self._on_ready, 10)
-        self._done_pub = self.create_publisher(String, "/box_done", 10)
-
-    def _on_ready(self, msg):
-        if msg.data not in self._processed_boxes:
-            self._ready_box = msg.data
-
-    def wait_for_box(self):
-        """Block until a box is announced at the pickup point; return its name."""
-        self._ready_box = None
-        while rclpy.ok() and self._ready_box is None:
-            rclpy.spin_once(self, timeout_sec=0.1)
-        self._processed_boxes.add(self._ready_box)
-        return self._ready_box
-
-    def box_done(self, name):
-        """Tell the feeder the box has been palletized; release the next."""
-        self._done_pub.publish(String(data=name))
-
-
-def pick(link):
+def pick():
     """Lower onto the box at the pickup point, grip, and lift clear."""
     bx = PICK_WORLD_X
     by = PICK_WORLD_Y
@@ -137,17 +106,17 @@ def pick(link):
 
     # Swing gracefully from home to a safe high clearance point directly over the box
     HAL.MoveJoint([bx, by, approach_z + 0.3], CUP_DOWN_YPR, SPEED, SETTLE)
-    
+
     # Smooth, single vertical descent onto the box
     HAL.MoveLinear([bx, by, grip_z], CUP_DOWN_YPR, SPEED, SETTLE)
-    
+
     HAL.SuctionSet(True, GRIP_PAUSE)                                   # vacuum on
-    
+
     # Lift the box clear in a single motion
     HAL.MoveLinear([bx, by, approach_z + 0.3], CUP_DOWN_YPR, SPEED, SETTLE)
 
 
-def place(link, index):
+def place(index):
     """Carry the held box to grid cell `index` and release it."""
     wx, wy, wz, layer, row, col = grid_cell(index)
     # tool0 sits CUP_REACH + box height above the target box centre.
@@ -163,9 +132,6 @@ def place(link, index):
 
 
 def main():
-    # rclpy is already initialised by HAL; just add our coordination node.
-    link = FeederLink()
-
     # Natural 'up' home pose: [pan, lift, elbow, w1, w2, w3] in DEGREES
     # This keeps the arm safely clear of the workspace without awkward IK contortions.
     home_joints = [0.0, -90.0, 0.0, -90.0, 0.0, 0.0]
@@ -173,20 +139,19 @@ def main():
 
     total = GRID_COLS * GRID_ROWS * GRID_LAYERS
     for index in range(total):
-        name = link.wait_for_box()
+        name = HAL.WaitForBox()
         if name is None:
             break
         print(f"box {name} ready -> placing as #{index}")
-        
-        pick(link)
-        place(link, index)
-        link.box_done(name)
-        
+
+        pick()
+        place(index)
+        HAL.BoxDone(name)
+
         # Return to home pose before waiting for the next box to ensure a clean sweep
         HAL.MoveAbsJ(home_joints, SPEED, SETTLE)
 
     print("palletizing complete")
-    link.destroy_node()
 
 
 if __name__ == "__main__":
